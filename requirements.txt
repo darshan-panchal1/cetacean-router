@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# LLM & Agent Framework
+groq
+langgraph
+langchain-core
+
+# MCP Server
+fastmcp
+
+# Marine Biology Data
+pyobis
+
+# Geospatial & Math
+shapely
+geopy
+
+# Utilities
+python-dotenv
+httpx
