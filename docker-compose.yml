@@ -1,0 +1,66 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────
+# Local development stack
+# Usage:
+#   docker compose up             # start API + MCP servers
+#   docker compose up --build     # rebuild image first
+#   docker compose logs -f api    # tail API logs
+# ─────────────────────────────────────────────────────────────────
+
+services:
+
+  api:
+    build:
+      context: .
+      target: runtime
+    image: cetacean-router:latest
+    container_name: cetacean-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - LOG_LEVEL=INFO
+    volumes:
+      # Hot-reload source in development (remove in production)
+      - .:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  obis-mcp:
+    build:
+      context: .
+      target: runtime
+    image: cetacean-router:latest
+    container_name: cetacean-obis-mcp
+    command: ["python", "-m", "mcp_servers.obis_server"]
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+
+  route-calc-mcp:
+    build:
+      context: .
+      target: runtime
+    image: cetacean-router:latest
+    container_name: cetacean-route-mcp
+    command: ["python", "-m", "mcp_servers.route_calc_server"]
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
