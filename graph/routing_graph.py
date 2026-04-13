@@ -182,34 +182,51 @@ def _create_nodes(
 
 
 # ---------------------------------------------------------------------------
-# Graph factory
+# Module-level singletons
+# Built ONCE on cold start — reused on every warm invocation.
+# This eliminates per-call agent instantiation and graph compilation
+# overhead, which was the primary cause of slowness on RunPod serverless.
 # ---------------------------------------------------------------------------
 
-def create_routing_graph(obis_tool: Callable, route_calc_tool: Callable):
-    """Build and compile the LangGraph async workflow."""
-    navigator = NavigatorAgent()
-    biologist = BiologistAgent()
-    risk_manager = RiskManagerAgent()
+_navigator    = NavigatorAgent()
+_biologist    = BiologistAgent()
+_risk_manager = RiskManagerAgent()
 
-    nav_node, bio_node, rm_node, should_continue = _create_nodes(
-        navigator, biologist, risk_manager
-    )
+_nav_node, _bio_node, _rm_node, _should_continue = _create_nodes(
+    _navigator, _biologist, _risk_manager
+)
 
+
+def _build_graph():
     workflow = StateGraph(RoutingState)
-    workflow.add_node("navigator", nav_node)
-    workflow.add_node("biologist", bio_node)
-    workflow.add_node("risk_manager", rm_node)
-
+    workflow.add_node("navigator", _nav_node)
+    workflow.add_node("biologist", _bio_node)
+    workflow.add_node("risk_manager", _rm_node)
     workflow.set_entry_point("navigator")
     workflow.add_edge("navigator", "biologist")
     workflow.add_edge("biologist", "risk_manager")
     workflow.add_conditional_edges(
         "risk_manager",
-        should_continue,
+        _should_continue,
         {"continue": "navigator", "end": END},
     )
-
     return workflow.compile()
+
+
+_compiled_graph = _build_graph()   # compiled once at import time
+
+
+# ---------------------------------------------------------------------------
+# Graph factory  (kept for API compatibility with api/main.py)
+# ---------------------------------------------------------------------------
+
+def create_routing_graph(obis_tool: Callable, route_calc_tool: Callable):
+    """
+    Returns the pre-compiled graph singleton.
+    obis_tool / route_calc_tool are kept as params for API compatibility
+    but are injected via RoutingState at runtime — no recompilation needed.
+    """
+    return _compiled_graph
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +258,6 @@ async def run_routing_optimization(
         start, end, max_iterations,
     )
 
-    graph = create_routing_graph(obis_tool, route_calc_tool)
-
     initial_state: RoutingState = {
         "start_point": start,
         "end_point": end,
@@ -260,7 +275,8 @@ async def run_routing_optimization(
         "routes_this_iteration": 0,
     }
 
-    final_state = await graph.ainvoke(initial_state)  # must be ainvoke for async nodes
+    # Use the pre-compiled singleton — no rebuild cost per call
+    final_state = await _compiled_graph.ainvoke(initial_state)
 
     logger.info(
         "Optimisation complete | selected=%s | approved=%s | iterations=%d",

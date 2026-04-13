@@ -18,12 +18,22 @@ Output:
   "decision_rationale": "...",
   "llm_analysis": "...",
   "approved": true,
+  "iterations": 2,
+  "all_routes_considered": [...],
   "metadata": {
     "iterations": 2,
     "routes_evaluated": 3,
-    "obis_cache_size": 4
+    "obis_cache_size": 4,
+    "start": [34.42, -119.70],
+    "end":   [45.52, -122.68]
   }
 }
+
+Performance note:
+  graph/routing_graph.py now builds agents and compiles the StateGraph at
+  module-import time (cold start), so every warm invocation skips that
+  overhead entirely.  This handler just calls run_routing_optimization()
+  which reuses the pre-compiled singleton.
 """
 
 import asyncio
@@ -36,7 +46,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import after load_dotenv so settings picks up the env file
+# Import after load_dotenv so settings picks up the env file.
+# Importing routing_graph also triggers the module-level singleton build
+# (NavigatorAgent, BiologistAgent, RiskManagerAgent, compiled StateGraph)
+# exactly once during cold start.
 from graph.routing_graph import run_routing_optimization
 from mcp_servers.obis_server import check_species_risk
 from mcp_servers.route_calc_server import calculate_route_metrics
@@ -50,7 +63,7 @@ logging.basicConfig(
 
 
 # ---------------------------------------------------------------------------
-# MCP tool wrappers (sync OBIS / route_calc → async-safe via to_thread)
+# MCP tool wrappers  (sync OBIS / route_calc → async-safe via to_thread)
 # ---------------------------------------------------------------------------
 
 async def _obis_tool(wkt_geometry: str, taxon: str = "Cetacea") -> dict:
@@ -92,13 +105,17 @@ def _validate_coord(obj: Any, name: str) -> tuple:
 async def handler(job: Dict) -> Dict:
     """
     RunPod async job handler.
+
+    The graph/routing_graph module builds and compiles the LangGraph
+    StateGraph once at import time.  This handler just invokes the
+    pre-compiled singleton, so there is no per-call compilation cost.
     """
     job_input = job.get("input", {})
 
     # --- Validate ---
     try:
         start = _validate_coord(job_input.get("start"), "start")
-        end = _validate_coord(job_input.get("end"), "end")
+        end   = _validate_coord(job_input.get("end"),   "end")
     except InputValidationError as exc:
         logger.warning("Validation error: %s", exc)
         return {"error": str(exc)}
@@ -129,17 +146,23 @@ async def handler(job: Dict) -> Dict:
     )
 
     return {
-        "selected_route": result["selected_route"],
-        "risk_assessment": last_risk,
-        "decision_rationale": result["decision_rationale"],
-        "llm_analysis": result["llm_analysis"],
-        "approved": result["approved"],
+        "selected_route":        result["selected_route"],
+        "risk_assessment":       last_risk,
+        "decision_rationale":    result["decision_rationale"],
+        "llm_analysis":          result["llm_analysis"],
+        "approved":              result["approved"],
+
+        # Top-level keys read directly by App.jsx
+        "iterations":            result["iteration_count"],
+        "all_routes_considered": result["proposed_routes"],
+
+        # Observability / debug block
         "metadata": {
-            "iterations": result["iteration_count"],
+            "iterations":       result["iteration_count"],
             "routes_evaluated": len(result["proposed_routes"]),
-            "obis_cache_size": len(obis_cache),
-            "start": list(start),
-            "end": list(end),
+            "obis_cache_size":  len(obis_cache),
+            "start":            list(start),
+            "end":              list(end),
         },
     }
 
