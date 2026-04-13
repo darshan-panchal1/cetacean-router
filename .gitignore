@@ -1,18 +1,14 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 .Python
 venv/
 env/
 ENV/
+.venv/
 
-# Google OAuth
-credentials.json
-token.json
-
-# Environment variables
+# Environment (never commit secrets)
 .env
 
 # IDE
@@ -28,3 +24,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Docker
+.dockerignore
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/

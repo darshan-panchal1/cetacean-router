@@ -1,410 +1,451 @@
 # Cetacean-Aware Logistics Router
 
-**AI-Powered Maritime Routing that Balances Logistics Efficiency with Marine Conservation**
+<p align="center">
 
-## Overview
+  <!-- Core Stack -->
+  <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python" />
+  <img src="https://img.shields.io/badge/FastAPI-Backend-green?logo=fastapi" />
+  <img src="https://img.shields.io/badge/React-18-blue?logo=react" />
+  <img src="https://img.shields.io/badge/Vite-Bundler-purple?logo=vite" />
 
-The Cetacean-Aware Logistics Router is a multi-agent AI system that calculates optimal shipping routes while minimizing the risk of ship strikes with endangered whales. The system uses:
+  <!-- AI / LLM -->
+  <img src="https://img.shields.io/badge/LangGraph-Agent%20Orchestration-black" />
+  <img src="https://img.shields.io/badge/Groq-LLM%20Inference-orange" />
 
-- **3 Specialized AI Agents** (Navigator, Marine Biologist, Risk Manager)
-- **LangGraph** for agent orchestration
-- **Groq LLMs** for intelligent decision-making
-- **MCP Servers** for real-time marine biology data (OBIS)
-- **FastAPI** for REST API access
+  <!-- Data / Geo -->
+  <img src="https://img.shields.io/badge/OBIS-Marine%20Data-blue" />
+  <img src="https://img.shields.io/badge/Shapely-Geometry-yellow" />
+  <img src="https://img.shields.io/badge/Haversine-Distance-lightgrey" />
+
+  <!-- Infra -->
+  <img src="https://img.shields.io/badge/Docker-Container-blue?logo=docker" />
+  <img src="https://img.shields.io/badge/RunPod-Serverless-red" />
+
+</p>
+
+**AI-powered maritime route optimisation that balances shipping efficiency with cetacean conservation.**
+
+A 3-agent LangGraph system — Navigator, Marine Biologist, Risk Manager — queries live OBIS cetacean sighting data and uses Groq LLMs to select the safest, most efficient shipping route. Deployable as a local FastAPI service or on RunPod Serverless.
+
+---
+
+## Contents
+
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Environment variables](#environment-variables)
+- [Running locally](#running-locally)
+- [Docker](#docker)
+- [RunPod Serverless](#runpod-serverless)
+- [React UI](#react-ui)
+- [API reference](#api-reference)
+- [How it works](#how-it-works)
+- [Production notes](#production-notes)
+- [Limitations](#limitations)
+
+---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                    LangGraph Workflow                     │
-│                                                           │
-│  ┌───────────┐      ┌────────────┐      ┌──────────────┐  │
-│  │ Navigator │─────▶│ Biologist  │─────▶│ Risk Manager │  │
-│  │  Agent    │      │   Agent    │      │    Agent     │  │
-│  └───────────┘      └────────────┘      └──────────────┘  │
-│       │                    │                     │        │
-│       └────────────────────┴─────────────────────┘        │
-│                            │                              │
-└────────────────────────────┼──────────────────────────────┘
-                             │
-                    ┌────────┴────────┐
-                    │   MCP Servers   │
-                    ├─────────────────┤
-                    │ • OBIS Biology  │
-                    │ • Route Calc    │
-                    └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      LangGraph Workflow                         │
+│                                                                 │
+│  ┌─────────────┐       ┌─────────────┐       ┌──────────────┐   │
+│  │  Navigator  │──────▶│  Biologist  │──────▶│ Risk Manager │   │
+│  │   Agent     │       │    Agent    │       │    Agent     │   │
+│  └─────────────┘       └─────────────┘       └──────────────┘   │
+│        │  ◀──────────────────────────────────────── │           │
+│        │          (iterate if HIGH risk)            │           │
+└────────┼────────────────────────────────────────────┼───────────┘
+         │                                            │
+    Route calc                                    OBIS API
+    (Haversine)                              (pyobis · pandas)
 ```
 
-### Agent Responsibilities
+### Agents
 
-1. **Navigator Agent** - Calculates route options (direct, detour, reduced speed)
-2. **Biologist Agent** - Assesses ecological risk using OBIS marine mammal data
-3. **Risk Manager Agent** - Mediates between efficiency and safety, makes final decision
+| Agent | Responsibility |
+|---|---|
+| **Navigator** | Computes direct, detour, and reduced-speed route options using Haversine great-circle geometry |
+| **Biologist** | Queries the OBIS database for cetacean sightings along each route, classifies risk (LOW / MEDIUM / HIGH), identifies critical sectors |
+| **Risk Manager** | Scores all routes on a 0–100 composite (ETA 40 pts, distance 30 pts, ecology 30 pts), calls the Groq LLM for strategic analysis, applies hard approval rules |
 
-## Installation
+### Data sources
 
-### Prerequisites
+| Source | What it provides |
+|---|---|
+| **OBIS** (Ocean Biodiversity Information System) | Real cetacean occurrence records via `pyobis` |
+| **Groq** | Fast LLM inference (llama-3.3-70b-versatile) for agent reasoning |
+| **Haversine geometry** | Great-circle distance, ETA, fuel estimation |
 
-- Python 3.9+
-- Groq API key (get from [console.groq.com](https://console.groq.com))
+---
 
-### Setup
+## Quickstart
 
-1. **Clone or create project directory:**
 ```bash
-mkdir cetacean-router
+git clone <repo-url>
 cd cetacean-router
-```
 
-2. **Install dependencies:**
-```bash
-pip install -r requirements.txt
-```
+# 1. Install dependencies
+make install           # or: pip install -r requirements.txt
 
-3. **Configure environment:**
-```bash
+# 2. Configure environment
 cp .env.example .env
-# Edit .env and add your Groq API key
+# Add GROQ_API_KEY — all other defaults work locally
+
+# 3. Start the API
+make api               # FastAPI on http://localhost:8000
+
+# 4. (Optional) Interactive CLI
+make cli
 ```
 
-4. **Verify installation:**
+---
+
+## Environment variables
+
+### Backend (`.env`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | — | **Required for LLM reasoning.** Get from [console.groq.com](https://console.groq.com). Without it, routing still works but LLM analysis is skipped. |
+| `API_HOST` | `0.0.0.0` | FastAPI bind address |
+| `API_PORT` | `8000` | FastAPI port |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins. Set to your frontend domain in production. |
+| `NAVIGATOR_MODEL` | `llama-3.3-70b-versatile` | Groq model for the Navigator agent |
+| `BIOLOGIST_MODEL` | `llama-3.3-70b-versatile` | Groq model for the Biologist agent |
+| `RISK_MANAGER_MODEL` | `llama-3.3-70b-versatile` | Groq model for the Risk Manager agent |
+| `DEFAULT_SHIP_SPEED_KNOTS` | `18` | Cruising speed used for direct and detour routes |
+| `REDUCED_SPEED_KNOTS` | `10` | Speed used for reduced-speed whale-safe routes |
+| `RISK_THRESHOLD_HIGH` | `50` | OBIS sightings count above which risk is classified HIGH |
+| `RISK_THRESHOLD_MEDIUM` | `10` | OBIS sightings count above which risk is classified MEDIUM |
+| `OBIS_CACHE_TTL_SECONDS` | `3600` | TTL for in-memory OBIS response cache |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `60` | Seconds before an open circuit probes again |
+| `API_RATE_LIMIT_PER_MINUTE` | `30` | Requests per IP per minute (slowapi) |
+
+### Frontend (`ui/.env.local`)
+
+| Variable | Description |
+|---|---|
+| `VITE_RUNPOD_ENDPOINT_ID` | RunPod serverless endpoint ID. If blank, the UI falls back to `VITE_LOCAL_API_URL`. |
+| `VITE_RUNPOD_API_KEY` | RunPod API key |
+| `VITE_LOCAL_API_URL` | Local FastAPI base URL (default: `http://localhost:8000`) |
+
+---
+
+## Running locally
+
+### API only
+
 ```bash
-python -c "import groq, langgraph, fastmcp, pyobis; print('All dependencies installed!')"
-```
+# Install + configure
+pip install -r requirements.txt
+cp .env.example .env   # add GROQ_API_KEY
 
-## Usage
+# Start FastAPI
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
-### Command Line Interface
+# Health check
+curl http://localhost:8000/health
 
-Run the main script for interactive examples:
-
-```bash
-python main.py
-```
-
-Options:
-- **Option 1**: California to Oregon (Blue Whale Migration Route)
-- **Option 2**: Transatlantic Route (NY to Portugal)
-- **Option 3**: Pacific Route (LA to Honolulu)
-- **Option 4**: Custom Route (enter your own coordinates)
-- **Option 5**: Run all examples
-- **Option 6**: Start API server
-
-### REST API
-
-Start the FastAPI server:
-
-```bash
-python -m api.main
-# or from menu: select option 6
-```
-
-API will be available at `http://localhost:8000`
-
-#### API Endpoints
-
-**Health Check:**
-```bash
-curl http://localhost:8000/
-```
-
-**Optimize Route:**
-```bash
-curl -X POST http://localhost:8000/optimize-route \\
-  -H "Content-Type: application/json" \\
+# Test a route
+curl -X POST http://localhost:8000/optimize-route \
+  -H "Content-Type: application/json" \
   -d '{
-    "start": {"latitude": 34.0, "longitude": -120.0},
-    "end": {"latitude": 37.0, "longitude": -122.0},
+    "start": {"latitude": 34.4208, "longitude": -119.6982},
+    "end":   {"latitude": 45.5152, "longitude": -122.6784},
     "max_iterations": 3
   }'
 ```
 
-**Interactive API Docs:**
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-
-### Programmatic Usage
-
-```python
-from config.settings import settings
-from graph.routing_graph import run_routing_optimization
-from mcp_servers.obis_server import check_species_risk
-from mcp_servers.route_calc_server import calculate_route_metrics
-
-# Define route
-start = (34.42, -119.70)  # Santa Barbara
-end = (45.52, -122.68)     # Portland
-
-# Run optimization
-result = run_routing_optimization(
-    start=start,
-    end=end,
-    obis_tool=check_species_risk,
-    route_calc_tool=calculate_route_metrics,
-    max_iterations=3
-)
-
-# Access results
-selected_route = result['selected_route']
-risk_assessment = result['risk_assessments'][-1]
-print(f"Route: {selected_route['route_name']}")
-print(f"Risk: {risk_assessment['risk_level']}")
-```
-
-## Configuration
-
-Edit `.env` file to customize:
+### Interactive CLI
 
 ```bash
-# Groq API
-GROQ_API_KEY=your_key_here
-
-# Models (choose from Groq's available models)
-NAVIGATOR_MODEL=mixtral-8x7b-32768
-BIOLOGIST_MODEL=mixtral-8x7b-32768
-RISK_MANAGER_MODEL=llama3-70b-8192
-
-# Routing Parameters
-DEFAULT_SHIP_SPEED_KNOTS=18
-REDUCED_SPEED_KNOTS=10
-RISK_THRESHOLD_HIGH=50
-RISK_THRESHOLD_MEDIUM=10
+python main.py
+# Choose from preset routes or enter custom coordinates
 ```
 
-## Project Structure
+### MCP servers (optional, standalone)
 
+```bash
+# Terminal 1 — OBIS data server
+python -m mcp_servers.obis_server
+
+# Terminal 2 — Route calculator
+python -m mcp_servers.route_calc_server
 ```
-cetacean-router/
-├── README.md                 # This file
-├── requirements.txt          # Python dependencies
-├── .env                      # Configuration (create from .env.example)
-├── main.py                   # Main CLI entry point
-│
-├── config/
-│   └── settings.py          # Centralized configuration
-│
-├── agents/                   # AI Agent implementations
-│   ├── navigator.py         # Route calculation agent
-│   ├── biologist.py         # Ecological assessment agent
-│   └── risk_manager.py      # Decision-making agent
-│
-├── graph/
-│   └── routing_graph.py     # LangGraph workflow definition
-│
-├── mcp_servers/             # Model Context Protocol servers
-│   ├── obis_server.py       # Marine biology data (OBIS)
-│   └── route_calc_server.py # Route calculations
-│
-├── api/                      # FastAPI REST API
-│   ├── main.py              # API endpoints
-│   └── models.py            # Pydantic models
-│
-└── utils/
-    └── geometry.py          # Geospatial utilities
-```
-
-## How It Works
-
-### The Optimization Loop
-
-1. **Navigator** proposes initial direct route
-2. **Biologist** queries OBIS database for cetacean sightings along route
-3. If **HIGH RISK** detected:
-   - **Navigator** calculates alternatives (detour or reduced speed)
-   - **Biologist** re-assesses new routes
-4. **Risk Manager** evaluates all options using composite scoring:
-   - ETA efficiency (40 points)
-   - Distance efficiency (30 points)
-   - Ecological safety (30 points)
-5. **Risk Manager** uses Groq LLM for strategic analysis
-6. System iterates until acceptable route found or max iterations reached
-
-### Scoring Algorithm
-
-```python
-composite_score = (
-    eta_score +      # Lower ETA = better (max 40 pts)
-    distance_score + # Shorter route = better (max 30 pts)
-    risk_score       # Lower ecological risk = better (max 30 pts)
-)
-```
-
-### Risk Levels
-
-- **LOW** (0-10 sightings): Proceed normally
-- **MEDIUM** (11-50 sightings): Consider speed reduction
-- **HIGH** (50+ sightings): Require detour or significant speed reduction
-
-## Data Sources
-
-### OBIS (Ocean Biodiversity Information System)
-- **Free, open-access** global marine species database
-- 100M+ occurrence records
-- Accessed via `pyobis` Python library
-- Real scientific observation data
-
-### Route Calculations
-- Haversine formula for great circle distances
-- Spherical geometry for accurate maritime navigation
-- Custom algorithms for waypoint generation
-
-## Example Output
-
-```
-==================================================================
-CETACEAN-AWARE LOGISTICS ROUTER
-==================================================================
-Start: (34.4208, -119.6982)
-End: (45.5152, -122.6784)
-
-[Navigator Agent] Calculating route options...
-Navigator reasoning: The direct route offers optimal efficiency...
-
-[Biologist Agent] Assessing ecological risk...
-  Route Alpha (Direct): HIGH (67 sightings)
-
-[Navigator Agent] Calculating route options...
-  Route Beta (Detour): 540nm, +2.5hrs
-  Route Gamma (Reduced Speed): 500nm, +8hrs
-
-[Risk Manager Agent] Evaluating options...
-
-Selected: Route Beta (Detour)
-Score: 82.5/100
-Approved: True
-
-==================================================================
-FINAL ROUTING DECISION
-==================================================================
-
-✓ Selected Route: Route Beta (Detour)
-  Distance: 540.0 nautical miles
-  ETA: 30.0 hours (1.2 days)
-  Speed: 18.0 knots
-  Waypoints: 3
-
-🐋 Ecological Assessment:
-  Risk Level: MEDIUM
-  Cetacean Sightings: 23
-  Species Detected: 2
-
-📊 Decision Metrics:
-  Approved: ✓ Yes
-  Iterations: 2
-  Routes Evaluated: 3
-
-💡 Rationale:
-  Selected Route Beta (Detour) with composite score 82.5/100...
-
-🤖 AI Analysis:
-  Recommend Route Beta (Detour). While adding 2.5 hours...
-```
-
-## MCP Server Details
-
-### OBIS Server (`mcp_servers/obis_server.py`)
-
-**Tools:**
-- `check_species_risk(wkt_geometry, taxon)` - Query marine mammal sightings
-- `get_sector_details(lat_min, lat_max, lon_min, lon_max)` - Detailed sector analysis
-
-**Protocol:** FastMCP  
-**Data Source:** OBIS API via pyobis
-
-### Route Calculator Server (`mcp_servers/route_calc_server.py`)
-
-**Tools:**
-- `calculate_route_metrics(waypoints, speed_knots)` - Comprehensive route metrics
-- `generate_detour_waypoints(start, end, avoid_sector)` - Alternative route generation
-
-**Protocol:** FastMCP  
-**Calculations:** Haversine distance, ETA, fuel estimates
-
-## Advanced Usage
-
-### Custom Risk Thresholds
-
-```python
-from config.settings import settings
-
-# Modify thresholds
-settings.risk_threshold_high = 75
-settings.risk_threshold_medium = 20
-```
-
-### Multi-Species Assessment
-
-```python
-# Assess specific species
-result = check_species_risk(
-    wkt_geometry="POLYGON(...)",
-    taxon="Balaenoptera musculus"  # Blue whale only
-)
-```
-
-### Custom Detour Margins
-
-```python
-from mcp_servers.route_calc_server import generate_detour_waypoints
-
-detour = generate_detour_waypoints(
-    start=[34.0, -120.0],
-    end=[37.0, -122.0],
-    avoid_sector={...},
-    detour_margin_degrees=2.0  # Wider safety margin
-)
-```
-
-## Limitations
-
-1. **OBIS Data Coverage**: Historical observations may not reflect current migrations
-2. **Weather**: Does not account for storms or sea conditions
-3. **Traffic**: No integration with real-time AIS ship traffic
-4. **Fuel Model**: Simplified fuel consumption calculations
-5. **API Rate Limits**: OBIS queries should be rate-limited for production
-
-## Production Deployment
-
-For production use:
-
-1. **Implement caching** for OBIS queries
-2. **Add real-time AIS** data integration
-3. **Include weather** routing
-4. **Add authentication** to API
-5. **Deploy MCP servers** separately with proper scaling
-6. **Monitor API usage** and costs
-7. **Add database** for route history
-8. **Implement webhooks** for route updates
-
-## Contributing
-
-To extend this system:
-
-1. **Add new agents**: Create in `agents/` directory
-2. **Extend workflow**: Modify `graph/routing_graph.py`
-3. **Add data sources**: Create new MCP servers
-4. **Improve scoring**: Update `risk_manager.py` scoring logic
-
-## License
-
-This project demonstrates AI-powered conservation technology.  
-Use responsibly and in accordance with maritime regulations.
-
-## Citations
-
-- OBIS: Ocean Biodiversity Information System - [https://obis.org](https://obis.org)
-- FastMCP: [https://github.com/jlowin/fastmcp](https://github.com/jlowin/fastmcp)
-- LangGraph: [https://github.com/langchain-ai/langgraph](https://github.com/langchain-ai/langgraph)
-- Groq: [https://groq.com](https://groq.com)
-
-## Support
-
-For issues or questions:
-1. Check API key configuration in `.env`
-2. Verify all dependencies installed: `pip install -r requirements.txt`
-3. Test OBIS connectivity: `python -c "from pyobis import occurrences; print('OK')"`
-4. Check Groq API status: [https://status.groq.com](https://status.groq.com)
 
 ---
 
-**🐋 Protecting marine life, one route at a time.**
+## Docker
+
+### Single container
+
+```bash
+# Build
+docker build -t cetacean-router:latest .
+
+# Run API
+docker run -p 8000:8000 --env-file .env cetacean-router:latest
+
+# Run RunPod handler
+docker run --env-file .env cetacean-router:latest python rp_handler.py
+```
+
+### Full stack (docker compose)
+
+```bash
+docker compose up --build        # starts API + both MCP servers
+docker compose logs -f api       # tail logs
+docker compose down              # stop everything
+```
+
+Services:
+
+| Service | Port | Description |
+|---|---|---|
+| `api` | 8000 | FastAPI REST API |
+| `obis-mcp` | 8001 | OBIS Marine Biology MCP server |
+| `route-calc-mcp` | 8002 | Route Calculator MCP server |
+
+---
+
+## RunPod Serverless
+
+### Deploy
+
+1. Push the image to a registry:
+   ```bash
+   docker build -t your-registry/cetacean-router:latest .
+   docker push your-registry/cetacean-router:latest
+   ```
+
+2. Create a RunPod Serverless endpoint using the image. Set the handler command:
+   ```
+   python rp_handler.py
+   ```
+
+3. Set environment variables in the RunPod endpoint settings (same as `.env`).
+
+### Input schema
+
+```json
+{
+  "input": {
+    "start":          { "latitude": 34.42, "longitude": -119.70 },
+    "end":            { "latitude": 45.52, "longitude": -122.68 },
+    "max_iterations": 3
+  }
+}
+```
+
+### Output schema
+
+```json
+{
+  "selected_route":      { "route_name": "Route Beta (Detour)", "distance_nm": 720.1, "eta_hours": 40.0, "speed_knots": 18, "waypoints": [...] },
+  "risk_assessment":     { "risk_level": "MEDIUM", "sighting_count": 23, "species_list": ["Balaenoptera musculus"], "risk_score": 5 },
+  "decision_rationale":  "Selected Route Beta (Detour) (score 76.2/100)…",
+  "llm_analysis":        "Recommend Route Beta…",
+  "approved":            true,
+  "metadata": {
+    "iterations":        2,
+    "routes_evaluated":  3,
+    "obis_cache_size":   4,
+    "start":             [34.42, -119.70],
+    "end":               [45.52, -122.68]
+  }
+}
+```
+
+---
+
+## React UI
+
+The UI is a standalone Vite + React application. It connects to either the RunPod endpoint or a local FastAPI server.
+
+### Setup
+
+```bash
+cd ui
+cp .env.example .env.local
+
+# For RunPod deployment
+echo "VITE_RUNPOD_ENDPOINT_ID=your-endpoint-id"  >> .env.local
+echo "VITE_RUNPOD_API_KEY=your-api-key"           >> .env.local
+
+# For local development (default)
+echo "VITE_LOCAL_API_URL=http://localhost:8000"   >> .env.local
+
+npm install
+npm run dev      # http://localhost:5173
+npm run build    # production build → dist/
+```
+
+### Features
+
+- 3-agent pipeline visualisation with live state (idle / active / done / error)
+- Preset routes for common maritime corridors
+- SVG route map showing all evaluated routes
+- Metrics: distance, ETA, speed, sightings
+- Full routes comparison table
+- Detected species list
+- Agent log with timestamps
+- Graceful degradation when RunPod is not configured (falls back to local API)
+
+---
+
+## API reference
+
+### `GET /health`
+
+Returns system status including circuit breaker states and OBIS cache size.
+
+```json
+{
+  "api":              "operational",
+  "groq_api":         "configured",
+  "circuit_breakers": { "groq_navigator": "closed", "obis_api": "closed" },
+  "obis_cache_size":  12
+}
+```
+
+### `POST /optimize-route`
+
+Synchronous route optimisation. Rate-limited to 30 req/min per IP.
+
+**Request body:**
+
+```json
+{
+  "start":          { "latitude": 34.42, "longitude": -119.70 },
+  "end":            { "latitude": 45.52, "longitude": -122.68 },
+  "max_iterations": 3
+}
+```
+
+**Response:**
+
+```json
+{
+  "success":               true,
+  "selected_route":        { ... },
+  "risk_assessment":       { ... },
+  "decision_rationale":    "...",
+  "llm_analysis":          "...",
+  "approved":              true,
+  "iterations":            2,
+  "all_routes_considered": [ ... ],
+  "elapsed_seconds":       14.2
+}
+```
+
+### `POST /optimize-route/stream`
+
+Server-Sent Events stream. Yields `status`, `result`, and `done` events. Useful for real-time progress in UIs.
+
+```
+event: status
+data: {"message": "Navigator agent calculating routes…"}
+
+event: result
+data: { ...full result object... }
+
+event: done
+data: {}
+```
+
+---
+
+## How it works
+
+### Optimisation loop
+
+```
+Iteration 1:
+  Navigator  → direct route only
+  Biologist  → OBIS query → HIGH risk detected
+  Risk Mgr   → score = 15/100, approved = false
+
+Iteration 2:
+  Navigator  → direct + detour + reduced-speed routes
+  Biologist  → OBIS query on each → detour = MEDIUM, reduced = LOW
+  Risk Mgr   → score detour = 76/100, approved = true → STOP
+```
+
+### Composite scoring (0–100)
+
+```
+eta_score      = max(0,  40 - (eta_hours  / 48)   × 40)
+distance_score = max(0,  30 - (distance   / 1000)  × 30)
+ecology_score  =         30 - (risk_score / 10)    × 30
+
+composite = eta_score + distance_score + ecology_score
+```
+
+### Hard approval rules (override scoring)
+
+- Direct route through a HIGH-risk sector → **rejected**
+- Any route with > 100 sightings → **rejected**
+- Direct route with UNKNOWN risk (OBIS failure) → **rejected** (fail-safe)
+
+### Resilience
+
+| Mechanism | Applies to | Behaviour |
+|---|---|---|
+| TTL cache | OBIS queries | 1-hour in-memory cache keyed by WKT geometry hash |
+| Circuit breaker | Groq LLM + OBIS API | Opens after 5 failures, probes after 60 s |
+| Async retry | All LLM calls | 3 attempts, exponential back-off (1 s, 2 s, 4 s) |
+| Rate limiting | FastAPI `/optimize-route` | 30 req/min per IP (slowapi) |
+
+---
+
+## Production notes
+
+1. **CORS**: Set `CORS_ORIGINS` to your frontend origin, not `*`.
+2. **OBIS rate limiting**: The free OBIS API has no hard rate limit but is a shared scientific resource. The built-in TTL cache significantly reduces query volume. For high-throughput deployments, increase `OBIS_CACHE_TTL_SECONDS`.
+3. **Workers**: The Dockerfile sets `--workers 1` intentionally. LangGraph's async graph is not designed for multi-worker shared state. To scale horizontally, run multiple containers behind a load balancer.
+4. **Authentication**: The API has no authentication layer. Add OAuth2 / API keys for public deployments.
+5. **Groq costs**: Each optimisation run makes 2–4 LLM calls. Monitor usage at [console.groq.com](https://console.groq.com).
+6. **AIS integration**: For real commercial use, integrate AIS (Automatic Identification System) data for live ship traffic awareness. This system uses only static whale sighting records.
+
+---
+
+## Limitations
+
+| Limitation | Notes |
+|---|---|
+| OBIS data is historical | Sighting records may not reflect current whale positions or seasonal migrations |
+| No weather routing | Sea state, currents, and storm avoidance are not modelled |
+| No AIS integration | Real-time ship traffic density is not considered |
+| Simplified fuel model | Uses a cubic speed-power relationship; does not account for vessel class |
+| OBIS query speed | Each query takes 5–15 s depending on geometry size. The TTL cache mitigates this on repeated routes. |
+| Single waypoint detour | Detour routes use one intermediate waypoint. Multi-waypoint avoidance corridors would improve real-world accuracy. |
+
+---
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| Agent orchestration | LangGraph |
+| LLM inference | Groq (llama-3.3-70b-versatile) |
+| Marine biology data | OBIS via pyobis |
+| API framework | FastAPI + uvicorn |
+| Containerisation | Docker (multi-stage) |
+| Serverless | RunPod |
+| Frontend | React 18 + Vite |
+| Geospatial | Shapely, Haversine |
+
+---
+
+## License
+
+For research and conservation use. Consult official maritime navigation authorities before voyage planning.
+
+---
+
+*🐋 Protecting marine life, one route at a time.*

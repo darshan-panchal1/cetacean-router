@@ -1,253 +1,212 @@
-from groq import Groq
-from typing import List, Dict
-from config.settings import settings
+import json
 import logging
 import time
-import json
+from typing import Dict, List, Optional
 
+from groq import AsyncGroq
+
+from config.settings import settings
+from utils.resilience import async_retry, get_breaker, CircuitOpenError
 
 # ------------------------------------------------------------------
-# Logging configuration
+# Logging
 # ------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-logger = logging.getLogger("RiskManagerAgent")
+logger = logging.getLogger("agents.risk_manager")
 
 
 class RiskManagerAgent:
-    '''
+    """
     Agent C: The Risk Manager (Supervisor)
-    Mediates between Navigator and Biologist to select optimal route.
-    '''
+    Mediates between Navigator and Biologist to select the optimal route.
+    Composite scoring: ETA efficiency (40 pts) + distance (30 pts) + ecology (30 pts).
+    """
 
     def __init__(self):
-        logger.info("Initializing RiskManagerAgent")
-        self.client = Groq(api_key=settings.groq_api_key)
+        logger.info("Initializing RiskManagerAgent | model=%s", settings.risk_manager_model)
+        self._client: Optional[AsyncGroq] = (
+            AsyncGroq(api_key=settings.groq_api_key)
+            if settings.groq_configured
+            else None
+        )
         self.model = settings.risk_manager_model
-        logger.info("RiskManagerAgent initialized | model=%s", self.model)
+        self._breaker = get_breaker(
+            "groq_risk_manager",
+            failure_threshold=settings.circuit_breaker_failure_threshold,
+            recovery_timeout=settings.circuit_breaker_recovery_timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # Scoring & selection
+    # ------------------------------------------------------------------
 
     def evaluate_route_options(
         self,
         routes: List[Dict],
-        risk_assessments: List[Dict]
+        risk_assessments: List[Dict],
     ) -> Dict:
-        '''
-        Evaluate all route options and select the best compromise.
-        '''
-        logger.info("evaluate_route_options invoked")
-        logger.debug(
-            "Routes count=%s | Risk assessments count=%s",
-            len(routes), len(risk_assessments)
-        )
+        """
+        Evaluate all route/risk pairs and select the best composite score.
+        Routes and risk_assessments must be index-aligned.
+        """
+        if not routes or not risk_assessments:
+            raise ValueError("Cannot evaluate: no routes or risk assessments provided")
 
-        scored_routes = []
+        # Pair only aligned entries (guard against accumulation drift)
+        pairs = list(zip(routes, risk_assessments))
 
-        # ------------------------------------------------------------------
-        # Composite scoring
-        # ------------------------------------------------------------------
-        for idx, (route, risk) in enumerate(zip(routes, risk_assessments)):
-            score = self._calculate_composite_score(route, risk)
+        scored = []
+        for route, risk in pairs:
+            score = self._composite_score(route, risk)
             logger.info(
-                "Route scored | index=%s name=%s score=%s",
-                idx, route.get("route_name"), score
+                "Scored | route=%s | score=%.1f | risk=%s",
+                route.get("route_name"), score, risk.get("risk_level"),
             )
+            scored.append({"route": route, "risk": risk, "composite_score": score})
 
-            scored_routes.append({
-                "route": route,
-                "risk": risk,
-                "composite_score": score
-            })
+        scored.sort(key=lambda x: x["composite_score"], reverse=True)
+        best = scored[0]
 
-        scored_routes.sort(
-            key=lambda x: x["composite_score"],
-            reverse=True
-        )
-
-        selected = scored_routes[0]
+        rationale = self._rationale(best, scored)
         logger.info(
-            "Route selected | name=%s score=%s",
-            selected["route"].get("route_name"),
-            selected["composite_score"]
+            "Route selected | name=%s | score=%.1f",
+            best["route"].get("route_name"), best["composite_score"],
         )
-
-        rationale = self._generate_rationale(selected, scored_routes)
 
         return {
-            "selected_route": selected["route"],
-            "risk_assessment": selected["risk"],
-            "composite_score": selected["composite_score"],
-            "all_options": scored_routes,
-            "decision_rationale": rationale
+            "selected_route": best["route"],
+            "risk_assessment": best["risk"],
+            "composite_score": best["composite_score"],
+            "all_options": scored,
+            "decision_rationale": rationale,
         }
 
-    def _calculate_composite_score(
-        self,
-        route: Dict,
-        risk: Dict
-    ) -> float:
-        '''
-        Calculate a composite score balancing efficiency and safety.
-        '''
+    def _composite_score(self, route: Dict, risk: Dict) -> float:
+        """
+        Composite score (0-100):
+          ETA score    – max 40 pts (penalises routes > 48 h linearly)
+          Distance     – max 30 pts (penalises routes > 1 000 nm linearly)
+          Ecology      – max 30 pts (inverse of risk_score/10)
+        """
+        eta_score = max(0.0, 40.0 - (route["eta_hours"] / 48.0) * 40.0)
+        dist_score = max(0.0, 30.0 - (route["distance_nm"] / 1000.0) * 30.0)
+        eco_score = 30.0 - (risk.get("risk_score", 5) / 10.0) * 30.0
+
+        total = round(eta_score + dist_score + eco_score, 2)
         logger.debug(
-            "Calculating composite score | route=%s risk=%s",
-            route.get("route_name"),
-            risk.get("risk_level")
+            "Score breakdown | route=%s | eta=%.1f dist=%.1f eco=%.1f total=%.1f",
+            route.get("route_name"), eta_score, dist_score, eco_score, total,
         )
+        return total
 
-        # ETA score (max 40)
-        eta_score = max(
-            0,
-            40 - (route["eta_hours"] / 48.0 * 40)
-        )
-
-        # Distance score (max 30)
-        distance_score = max(
-            0,
-            30 - (route["distance_nm"] / 1000.0 * 30)
-        )
-
-        # Risk score (max 30, inverse)
-        risk_score_raw = risk.get("risk_score", 5)
-        risk_score = 30 - (risk_score_raw / 10.0 * 30)
-
-        total_score = eta_score + distance_score + risk_score
-
-        logger.debug(
-            "Score breakdown | eta=%.2f distance=%.2f risk=%.2f total=%.2f",
-            eta_score, distance_score, risk_score, total_score
-        )
-
-        return round(total_score, 2)
-
-    def _generate_rationale(
-        self,
-        selected: Dict,
-        all_options: List[Dict]
-    ) -> str:
-        '''
-        Generate human-readable decision rationale.
-        '''
+    def _rationale(self, selected: Dict, all_options: List[Dict]) -> str:
         route = selected["route"]
         risk = selected["risk"]
-
-        logger.info(
-            "Generating rationale for route=%s",
-            route.get("route_name")
-        )
-
-        rationale = (
-            f"Selected {route['route_name']} with composite score "
-            f"{selected['composite_score']}/100. "
-            f"Route covers {route['distance_nm']} nm in "
-            f"{route['eta_hours']} hours. "
+        rejected = len(all_options) - 1
+        return (
+            f"Selected {route['route_name']} (score {selected['composite_score']}/100). "
+            f"Distance: {route['distance_nm']} nm, ETA: {route['eta_hours']} h. "
             f"Ecological risk: {risk['risk_level']} "
             f"({risk.get('sighting_count', 0)} cetacean sightings). "
+            + (f"Rejected {rejected} lower-scoring alternative(s)." if rejected else "")
         )
 
-        if len(all_options) > 1:
-            alternatives = [
-                opt for opt in all_options if opt != selected
-            ]
-            rationale += (
-                f"Rejected {len(alternatives)} alternative(s) "
-                f"with lower composite scores."
-            )
+    # ------------------------------------------------------------------
+    # LLM strategic analysis
+    # ------------------------------------------------------------------
 
-        logger.debug("Decision rationale=%s", rationale)
-        return rationale
-
-    def make_llm_decision(
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def make_llm_decision(
         self,
         routes: List[Dict],
-        risk_assessments: List[Dict]
+        risk_assessments: List[Dict],
     ) -> str:
-        '''
-        Use LLM to provide high-level strategic decision analysis.
-        '''
-        logger.info("make_llm_decision invoked")
+        """Use LLM to provide strategic analysis and final recommendation."""
+        if not self._client:
+            return "LLM unavailable — Groq API key not configured."
 
-        formatted_data = []
-        for route, risk in zip(routes, risk_assessments):
-            formatted_data.append({
-                "route_name": route["route_name"],
-                "distance_nm": route["distance_nm"],
-                "eta_hours": route["eta_hours"],
-                "speed_knots": route["speed_knots"],
-                "risk_level": risk["risk_level"],
-                "sightings": risk.get("sighting_count", 0)
-            })
+        if not self._breaker.is_available():
+            raise CircuitOpenError("groq_risk_manager circuit is open")
 
-        logger.debug("LLM input data=%s", formatted_data)
+        payload = [
+            {
+                "route": r["route_name"],
+                "distance_nm": r["distance_nm"],
+                "eta_hours": r["eta_hours"],
+                "speed_knots": r["speed_knots"],
+                "risk_level": a.get("risk_level"),
+                "sightings": a.get("sighting_count", 0),
+            }
+            for r, a in zip(routes, risk_assessments)
+        ]
 
-        prompt = f'''You are a maritime risk manager balancing commercial logistics and marine conservation.
+        prompt = f"""You are a maritime risk manager balancing commercial logistics and marine conservation.
 
 ROUTE OPTIONS:
-{json.dumps(formatted_data, indent=2)}
+{json.dumps(payload, indent=2)}
 
-Analyze the trade-offs and recommend the best route considering:
+Analyse trade-offs and recommend the best route (≤120 words) considering:
 1. Delivery schedule impact
-2. Ecological responsibility
+2. Ecological responsibility  
 3. Operational safety
-4. Corporate reputation
+4. Regulatory / reputational risk"""
 
-Provide a decisive recommendation with brief justification (under 120 words).'''
-
-        start_time = time.time()
-
+        t0 = time.monotonic()
         try:
-            response = self.client.chat.completions.create(
+            resp = await self._client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
                         "content": (
                             "You are an expert maritime risk manager "
-                            "specializing in sustainable shipping."
-                        )
+                            "specialising in sustainable shipping and IMO compliance."
+                        ),
                     },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "user", "content": prompt},
                 ],
-                temperature=0.5,
-                max_tokens=250
+                temperature=settings.llm_temperature_risk_manager,
+                max_tokens=settings.llm_max_tokens,
             )
+            self._breaker.record_success()
+            logger.info(
+                "LLM decision generated | elapsed=%.2fs", time.monotonic() - t0
+            )
+            return resp.choices[0].message.content
+        except Exception as exc:
+            self._breaker.record_failure()
+            raise exc
 
-            elapsed = round(time.time() - start_time, 2)
-            logger.info("LLM decision generated in %ss", elapsed)
-
-            return response.choices[0].message.content
-
-        except Exception as e:
-            logger.exception("Failed to generate LLM decision")
-            return f"LLM decision analysis unavailable: {str(e)}"
+    # ------------------------------------------------------------------
+    # Approval gate
+    # ------------------------------------------------------------------
 
     def approve_route(self, route: Dict, risk: Dict) -> bool:
-        '''
-        Final approval gate - reject routes that are too risky.
-        '''
+        """
+        Hard approval rules — these override scoring:
+        - Direct route through HIGH-risk sector → reject
+        - Sighting count > 100 on any route type → reject
+        - UNKNOWN risk on direct route → reject (treat as high)
+        """
+        risk_level = risk.get("risk_level", "UNKNOWN")
+        sightings = risk.get("sighting_count", 0)
+        route_type = route.get("route_type", "")
+
+        if risk_level == "HIGH" and route_type == "direct":
+            logger.warning("REJECTED: direct route through HIGH-risk sector")
+            return False
+
+        if sightings > 100:
+            logger.warning(
+                "REJECTED: excessive cetacean density (%d sightings)", sightings
+            )
+            return False
+
+        if risk_level == "UNKNOWN" and route_type == "direct":
+            logger.warning("REJECTED: direct route with UNKNOWN risk (fail-safe)")
+            return False
+
         logger.info(
-            "approve_route invoked | route=%s risk=%s",
-            route.get("route_name"),
-            risk.get("risk_level")
+            "APPROVED: %s | risk=%s | sightings=%d",
+            route.get("route_name"), risk_level, sightings,
         )
-
-        # Hard rules
-        if risk.get("risk_level") == "HIGH" and route.get("route_type") == "direct":
-            logger.warning(
-                "Route rejected: direct route through HIGH risk sector"
-            )
-            return False
-
-        if risk.get("sighting_count", 0) > 100:
-            logger.warning(
-                "Route rejected: excessive cetacean density (%s sightings)",
-                risk.get("sighting_count")
-            )
-            return False
-
-        logger.info("Route approved")
         return True

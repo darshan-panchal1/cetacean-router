@@ -1,25 +1,26 @@
 from pydantic import BaseModel, Field
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional
 
 
 class Coordinates(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
+    latitude: float = Field(..., ge=-90, le=90, description="Latitude in decimal degrees")
+    longitude: float = Field(..., ge=-180, le=180, description="Longitude in decimal degrees")
 
 
 class RouteRequest(BaseModel):
     start: Coordinates
     end: Coordinates
     max_iterations: Optional[int] = Field(default=3, ge=1, le=5)
-    
-    class Config:
-        json_schema_extra = {
+
+    model_config = {
+        "json_schema_extra": {
             "example": {
-                "start": {"latitude": 34.0, "longitude": -120.0},
-                "end": {"latitude": 37.0, "longitude": -122.0},
-                "max_iterations": 3
+                "start": {"latitude": 34.4208, "longitude": -119.6982},
+                "end": {"latitude": 45.5152, "longitude": -122.6784},
+                "max_iterations": 3,
             }
         }
+    }
 
 
 class RouteResponse(BaseModel):
@@ -31,9 +32,16 @@ class RouteResponse(BaseModel):
     approved: bool
     iterations: int
     all_routes_considered: List[Dict]
+    elapsed_seconds: Optional[float] = None
 
 
 class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
+
+
+class RouteStatusResponse(BaseModel):
+    event: str
+    message: Optional[str] = None
+    data: Optional[Dict] = None

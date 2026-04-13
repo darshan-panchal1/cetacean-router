@@ -1,224 +1,230 @@
-from groq import Groq
-from typing import List, Tuple, Dict
-from config.settings import settings
-from utils.geometry import create_route_buffer
+import asyncio
 import logging
 import time
-import json
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from groq import AsyncGroq
 
-# ------------------------------------------------------------------
-# Logging configuration
-# ------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+from config.settings import settings
+from utils.geometry import create_route_buffer
+from utils.resilience import (
+    TTLCache,
+    async_retry,
+    get_breaker,
+    CircuitOpenError,
+    obis_cache,
 )
-logger = logging.getLogger("BiologistAgent")
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logger = logging.getLogger("agents.biologist")
 
 
 class BiologistAgent:
-    '''
+    """
     Agent B: The Marine Biologist
-    Assesses ecological risk along proposed routes.
-    '''
+    Assesses ecological risk along proposed routes using OBIS data.
+    Caches OBIS results (geometry hash → response) to avoid redundant
+    API calls across iterations.
+    """
 
     def __init__(self):
-        logger.info("Initializing BiologistAgent")
-        self.client = Groq(api_key=settings.groq_api_key)
+        logger.info("Initializing BiologistAgent | model=%s", settings.biologist_model)
+        self._client: Optional[AsyncGroq] = (
+            AsyncGroq(api_key=settings.groq_api_key)
+            if settings.groq_configured
+            else None
+        )
         self.model = settings.biologist_model
-        logger.info("BiologistAgent initialized | model=%s", self.model)
+        self._breaker = get_breaker(
+            "groq_biologist",
+            failure_threshold=settings.circuit_breaker_failure_threshold,
+            recovery_timeout=settings.circuit_breaker_recovery_timeout,
+        )
 
-    def assess_route_risk(
+    # ------------------------------------------------------------------
+    # Core risk assessment
+    # ------------------------------------------------------------------
+
+    async def assess_route_risk(
         self,
         waypoints: List[Tuple[float, float]],
-        obis_tool_function
+        obis_tool_function: Callable,
     ) -> Dict:
-        '''
+        """
         Assess ecological risk for a route using OBIS data.
-        '''
-        logger.info("assess_route_risk invoked")
-        logger.debug("Waypoints received: %s", waypoints)
-
-        start_time = time.time()
-
-        # ------------------------------------------------------------------
-        # Geometry preparation
-        # ------------------------------------------------------------------
+        Results are cached by geometry to avoid redundant OBIS calls.
+        """
         wkt_geometry = create_route_buffer(waypoints, buffer_degrees=0.5)
-        logger.debug("Generated route buffer WKT=%s", wkt_geometry)
 
+        # Cache lookup
+        cache_key = obis_cache.make_key(wkt_geometry, "Cetacea")
+        cached = obis_cache.get(cache_key)
+        if cached is not None:
+            logger.info("OBIS cache hit | key=%s", cache_key)
+            return cached
+
+        t0 = time.monotonic()
         try:
-            # ------------------------------------------------------------------
-            # OBIS MCP call
-            # ------------------------------------------------------------------
-            logger.info("Calling OBIS MCP tool for cetacean risk assessment")
-            obis_result = obis_tool_function(
-                wkt_geometry=wkt_geometry,
-                taxon="Cetacea"
-            )
-
-            logger.debug("OBIS result=%s", obis_result)
+            logger.info("OBIS query | wkt_len=%d", len(wkt_geometry))
+            obis_result = await _call_obis(obis_tool_function, wkt_geometry, "Cetacea")
 
             if not obis_result.get("success", False):
-                logger.warning("OBIS risk assessment unsuccessful")
-                return {
-                    "risk_level": "UNKNOWN",
-                    "risk_score": 5,
-                    "sighting_count": 0,
-                    "species_list": [],
-                    "recommendation": "Unable to assess risk - proceed with caution"
-                }
+                logger.warning("OBIS returned unsuccessful result")
+                return _unknown_risk()
 
             risk_level = obis_result["risk_level"]
             risk_score = obis_result["risk_score"]
             sighting_count = obis_result["sighting_count"]
             species_list = obis_result.get("species_list", [])
 
-            logger.info(
-                "Risk summary | level=%s score=%s sightings=%s",
-                risk_level, risk_score, sighting_count
-            )
+            recommendation = _build_recommendation(risk_level)
 
-            # ------------------------------------------------------------------
-            # Recommendation logic
-            # ------------------------------------------------------------------
-            if risk_level == "HIGH":
-                recommendation = (
-                    "REJECT - High cetacean density detected. "
-                    "Recommend detour or speed reduction."
-                )
-            elif risk_level == "MEDIUM":
-                recommendation = (
-                    "CAUTION - Moderate risk. "
-                    "Consider speed reduction through this sector."
-                )
-            else:
-                recommendation = "ACCEPTABLE - Low risk detected."
-
-            elapsed = round(time.time() - start_time, 2)
-            logger.info("Route risk assessed in %ss", elapsed)
-
-            return {
+            result = {
                 "risk_level": risk_level,
                 "risk_score": risk_score,
                 "sighting_count": sighting_count,
                 "species_list": species_list,
                 "recommendation": recommendation,
-                "geometry_assessed": wkt_geometry
+                "geometry_assessed": wkt_geometry,
             }
 
-        except Exception as e:
+            obis_cache.set(cache_key, result)
+            elapsed = round(time.monotonic() - t0, 2)
+            logger.info(
+                "Route risk assessed | level=%s | sightings=%d | elapsed=%ss",
+                risk_level, sighting_count, elapsed,
+            )
+            return result
+
+        except Exception:
             logger.exception("Error during route risk assessment")
-            return {
-                "risk_level": "ERROR",
-                "risk_score": 0,
-                "error": str(e),
-                "recommendation": "Risk assessment failed"
-            }
+            return _unknown_risk()
 
-    def identify_critical_sectors(
+    async def identify_critical_sectors(
         self,
         waypoints: List[Tuple[float, float]],
-        obis_tool_function
+        obis_tool_function: Callable,
     ) -> List[Dict]:
-        '''
-        Break route into sectors and identify high-risk areas.
-        '''
-        logger.info("identify_critical_sectors invoked")
-        logger.debug("Waypoints=%s", waypoints)
+        """
+        Break route into segments and identify high/medium-risk sectors.
+        Sectors are assessed concurrently for speed.
+        """
+        logger.info(
+            "Identifying critical sectors | segments=%d", len(waypoints) - 1
+        )
 
-        critical_sectors = []
-
-        for i in range(len(waypoints) - 1):
-            start = waypoints[i]
-            end = waypoints[i + 1]
-
-            logger.info("Assessing sector %s | %s -> %s", i, start, end)
-
+        async def _assess_segment(i: int) -> Optional[Dict]:
+            start, end = waypoints[i], waypoints[i + 1]
             sector = {
                 "lat_min": min(start[0], end[0]) - 0.5,
                 "lat_max": max(start[0], end[0]) + 0.5,
                 "lon_min": min(start[1], end[1]) - 0.5,
                 "lon_max": max(start[1], end[1]) + 0.5,
-                "segment": i
+                "segment": i,
             }
-
             wkt = create_route_buffer([start, end], buffer_degrees=0.5)
-            logger.debug("Sector %s WKT=%s", i, wkt)
-
             try:
-                result = obis_tool_function(
-                    wkt_geometry=wkt,
-                    taxon="Cetacea"
-                )
-
-                logger.debug("Sector %s OBIS result=%s", i, result)
-
-                if result.get("risk_level") in ["HIGH", "MEDIUM"]:
+                result = await _call_obis(obis_tool_function, wkt, "Cetacea")
+                if result.get("risk_level") in ("HIGH", "MEDIUM"):
                     logger.warning(
-                        "Critical sector detected | segment=%s level=%s sightings=%s",
-                        i, result["risk_level"], result["sighting_count"]
+                        "Critical sector | seg=%d | level=%s | sightings=%d",
+                        i, result["risk_level"], result["sighting_count"],
                     )
-
-                    critical_sectors.append({
-                        **sector,
-                        "risk_level": result["risk_level"],
-                        "sighting_count": result["sighting_count"]
-                    })
-
+                    return {**sector, "risk_level": result["risk_level"],
+                            "sighting_count": result["sighting_count"]}
             except Exception:
-                logger.exception("Failed to assess sector %s", i)
+                logger.exception("Sector %d assessment failed", i)
+            return None
 
-        logger.info(
-            "Critical sector identification complete | count=%s",
-            len(critical_sectors)
-        )
+        tasks = [_assess_segment(i) for i in range(len(waypoints) - 1)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        critical = [r for r in results if r is not None]
 
-        return critical_sectors
+        logger.info("Critical sectors found: %d", len(critical))
+        return critical
 
-    def generate_biological_report(
+    # ------------------------------------------------------------------
+    # LLM biological report
+    # ------------------------------------------------------------------
+
+    @async_retry(max_attempts=3, base_delay=1.0, exceptions=(Exception,))
+    async def generate_biological_report(
         self,
         risk_assessment: Dict,
-        critical_sectors: List[Dict]
+        critical_sectors: List[Dict],
     ) -> str:
-        '''
-        Use LLM to generate biological assessment report.
-        '''
-        logger.info("generate_biological_report invoked")
+        """Use LLM to generate a biological assessment report."""
+        if not self._client:
+            return "LLM unavailable — Groq API key not configured."
 
-        prompt = f'''You are a marine conservation biologist. Generate a brief report on this route assessment:
+        if not self._breaker.is_available():
+            raise CircuitOpenError("groq_biologist circuit is open")
+
+        species_str = ", ".join(risk_assessment.get("species_list", [])[:5]) or "none identified"
+
+        prompt = f"""You are a marine conservation biologist. Summarise this route assessment (≤120 words):
 
 Overall Risk: {risk_assessment['risk_level']}
 Cetacean Sightings: {risk_assessment['sighting_count']}
 Critical Sectors: {len(critical_sectors)}
+Species: {species_str}
 
-Species Detected: {', '.join(risk_assessment.get('species_list', [])[:5])}
+Cover: (1) conservation concern, (2) key species at risk, (3) recommendation."""
 
-Provide:
-1. Conservation concern summary
-2. Key species at risk
-3. Recommendation
-
-Keep under 150 words.'''
-
-        logger.debug("LLM prompt=%s", prompt)
-
-        start_time = time.time()
-
+        t0 = time.monotonic()
         try:
-            response = self.client.chat.completions.create(
+            resp = await self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=250
+                temperature=settings.llm_temperature_biologist,
+                max_tokens=settings.llm_max_tokens,
             )
+            self._breaker.record_success()
+            logger.info(
+                "Biological report generated | elapsed=%.2fs",
+                time.monotonic() - t0,
+            )
+            return resp.choices[0].message.content
+        except Exception as exc:
+            self._breaker.record_failure()
+            raise exc
 
-            elapsed = round(time.time() - start_time, 2)
-            logger.info("Biological report generated in %ss", elapsed)
 
-            return response.choices[0].message.content
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        except Exception as e:
-            logger.exception("Failed to generate biological report")
-            return f"Biological report unavailable: {str(e)}"
+async def _call_obis(fn: Callable, wkt: str, taxon: str) -> Dict:
+    """
+    Call the OBIS tool function.  Wraps synchronous or async callables
+    so that sync tools (e.g. FastMCP) run in a thread-pool.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return await fn(wkt_geometry=wkt, taxon=taxon)
+    return await asyncio.to_thread(fn, wkt_geometry=wkt, taxon=taxon)
+
+
+def _unknown_risk() -> Dict:
+    return {
+        "risk_level": "UNKNOWN",
+        "risk_score": 5,
+        "sighting_count": 0,
+        "species_list": [],
+        "recommendation": "Risk assessment unavailable — proceed with caution.",
+    }
+
+
+def _build_recommendation(risk_level: str) -> str:
+    if risk_level == "HIGH":
+        return (
+            "REJECT — High cetacean density detected. "
+            "Detour or significant speed reduction required."
+        )
+    if risk_level == "MEDIUM":
+        return (
+            "CAUTION — Moderate cetacean activity. "
+            "Speed reduction through this sector recommended."
+        )
+    return "ACCEPTABLE — Low cetacean activity detected."

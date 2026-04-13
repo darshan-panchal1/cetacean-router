@@ -1,23 +1,30 @@
-fastapi
-uvicorn[standard]
-pydantic
-pydantic-settings
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
 
-# LLM & Agent Framework
-groq
-langgraph
-langchain-core
+# Rate limiting
+slowapi>=0.1.9
 
-# MCP Server
-fastmcp
+# LLM & agent framework
+groq>=0.9.0
+langgraph>=0.1.0
+langchain-core>=0.2.0
 
-# Marine Biology Data
-pyobis
+# MCP server
+fastmcp>=0.1.0
 
-# Geospatial & Math
-shapely
-geopy
+# Marine biology data
+pyobis>=1.3.0
+
+# Geospatial
+shapely>=2.0.0
+geopy>=2.4.0
 
 # Utilities
-python-dotenv
-httpx
+python-dotenv>=1.0.0
+httpx>=0.27.0
+
+# RunPod serverless (only needed for RunPod deployments)
+runpod>=1.6.0
