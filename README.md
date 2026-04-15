@@ -29,6 +29,14 @@ A 3-agent LangGraph system — Navigator, Marine Biologist, Risk Manager — que
 
 ---
 
+## 🌐 Live Application
+
+**[https://cetacean-router.netlify.app/](https://cetacean-router.netlify.app/)**
+
+The UI is hosted on Netlify and connects to the FastAPI backend. No installation required to try the demo.
+
+---
+
 ## Contents
 
 - [Architecture](#architecture)
