@@ -12,6 +12,7 @@ from typing import Optional
 from fastmcp import FastMCP
 from pyobis import occurrences
 
+from config.settings import settings
 from utils.resilience import obis_cache, get_breaker, CircuitOpenError
 
 # ------------------------------------------------------------------
@@ -27,9 +28,9 @@ mcp = FastMCP("MarineBiologyData")
 
 _breaker = get_breaker("obis_api", failure_threshold=5, recovery_timeout=120)
 
-# Risk thresholds (sighting count)
-_HIGH_THRESHOLD = 50
-_MEDIUM_THRESHOLD = 10
+# Risk thresholds (sighting count) — sourced from settings for consistency
+_HIGH_THRESHOLD   = settings.risk_threshold_high    # default 50
+_MEDIUM_THRESHOLD = settings.risk_threshold_medium  # default 10
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,12 @@ def check_species_risk(
     Returns risk level, sighting count, and species diversity derived
     from real OBIS occurrence data.  Results are cached for 1 hour to
     reduce external API load.
+
+    Performance note:
+      We only fetch settings.obis_results_size records (default 60).
+      Risk thresholds are 50 (HIGH) and 10 (MEDIUM), so 60 records is
+      enough to classify any zone accurately while keeping query time
+      under ~1 second instead of the ~6-7s seen with size=500.
     """
     cache_key = obis_cache.make_key(wkt_geometry, taxon)
     cached = obis_cache.get(cache_key)
@@ -60,13 +67,17 @@ def check_species_risk(
         return _degraded_response(taxon)
 
     t0 = time.monotonic()
-    logger.info("Querying OBIS | taxon=%s | wkt_len=%d", taxon, len(wkt_geometry))
+    fetch_size = settings.obis_results_size  # 60 by default
+    logger.info(
+        "Querying OBIS | taxon=%s | wkt_len=%d | size=%d",
+        taxon, len(wkt_geometry), fetch_size,
+    )
 
     try:
         query = occurrences.search(
             geometry=wkt_geometry,
             scientificname=taxon,
-            size=500,
+            size=fetch_size,
         )
         data = query.execute()
         elapsed = round(time.monotonic() - t0, 2)

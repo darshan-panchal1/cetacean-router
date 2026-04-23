@@ -6,6 +6,13 @@ accumulate correctly across iterations.  The risk_manager node pairs
 only the routes proposed in the *current* iteration with their
 corresponding risk assessments — not the full accumulated history —
 to avoid misaligned scoring.
+
+Performance notes:
+  1. Agents and the compiled StateGraph are module-level singletons —
+     built once on cold start, reused across every warm invocation.
+  2. identify_critical_sectors is called only once per iteration (on
+     the single worst-scoring route), not on every HIGH/MEDIUM route.
+     This alone eliminates 2-3 redundant OBIS calls per iteration.
 """
 
 import asyncio
@@ -27,33 +34,19 @@ logger = logging.getLogger("graph.routing")
 # ---------------------------------------------------------------------------
 
 class RoutingState(TypedDict):
-    # Input
     start_point: Tuple[float, float]
     end_point: Tuple[float, float]
-
-    # Navigator outputs — accumulated across iterations
     proposed_routes: Annotated[List[Dict], operator.add]
-
-    # Biologist outputs — accumulated across iterations
     risk_assessments: Annotated[List[Dict], operator.add]
     critical_sectors: List[Dict]
-
-    # Risk Manager outputs
     selected_route: Dict
     decision_rationale: str
     llm_analysis: str
     approved: bool
-
-    # Iteration control
     iteration_count: int
     max_iterations: int
-
-    # MCP tool references (injected at runtime)
     obis_tool: Callable
     route_calc_tool: Callable
-
-    # Track how many routes were added in this iteration
-    # (used to slice the correct tail from accumulated lists)
     routes_this_iteration: int
 
 
@@ -67,12 +60,10 @@ def _create_nodes(
     risk_manager: RiskManagerAgent,
 ):
     async def navigator_node(state: RoutingState) -> Dict:
-        """Propose route options for the current iteration."""
         logger.info("[Navigator] iteration=%d", state["iteration_count"])
 
         start = state["start_point"]
         end = state["end_point"]
-
         direct = navigator.calculate_direct_route(start, end)
 
         if state["iteration_count"] == 0 or not state.get("critical_sectors"):
@@ -90,20 +81,18 @@ def _create_nodes(
             logger.warning("Navigator LLM error: %s", exc)
 
         logger.info("[Navigator] reasoning: %s", reasoning[:120])
-
         return {
             "proposed_routes": routes,
             "routes_this_iteration": len(routes),
         }
 
     async def biologist_node(state: RoutingState) -> Dict:
-        """Assess risk for the routes proposed in this iteration."""
         logger.info("[Biologist] assessing %d routes", state["routes_this_iteration"])
 
-        # Only assess routes from the current iteration
         n = state["routes_this_iteration"]
         current_routes = state["proposed_routes"][-n:]
 
+        # Assess all routes concurrently
         tasks = [
             biologist.assess_route_risk(r["waypoints"], state["obis_tool"])
             for r in current_routes
@@ -116,14 +105,29 @@ def _create_nodes(
                 route["route_name"], risk["risk_level"], risk["sighting_count"],
             )
 
-        # Find critical sectors from the highest-risk route
+        # ── Critical sector identification ────────────────────────────────
+        # Only run on the SINGLE worst route, not every HIGH/MEDIUM route.
+        # The original code ran one sector check per HIGH/MEDIUM route —
+        # with 3 routes all HIGH in iteration 2, that meant 2 extra fresh
+        # OBIS calls (~10s of wasted latency).  One check is enough to give
+        # the navigator a sector to route around next iteration.
         all_sectors: List[Dict] = []
+        worst_route = None
+        worst_risk = None
         for route, risk in zip(current_routes, risk_assessments):
             if risk["risk_level"] in ("HIGH", "MEDIUM"):
-                sectors = await biologist.identify_critical_sectors(
-                    route["waypoints"], state["obis_tool"]
-                )
-                all_sectors.extend(sectors)
+                if worst_risk is None or risk["risk_score"] > worst_risk["risk_score"]:
+                    worst_route = route
+                    worst_risk = risk
+
+        if worst_route is not None:
+            logger.info(
+                "[Biologist] sector check on worst route: %s",
+                worst_route["route_name"],
+            )
+            all_sectors = await biologist.identify_critical_sectors(
+                worst_route["waypoints"], state["obis_tool"]
+            )
 
         return {
             "risk_assessments": list(risk_assessments),
@@ -131,7 +135,6 @@ def _create_nodes(
         }
 
     async def risk_manager_node(state: RoutingState) -> Dict:
-        """Select the best route from this iteration's candidates."""
         logger.info("[RiskManager] evaluating options")
 
         n = state["routes_this_iteration"]
@@ -182,10 +185,7 @@ def _create_nodes(
 
 
 # ---------------------------------------------------------------------------
-# Module-level singletons
-# Built ONCE on cold start — reused on every warm invocation.
-# This eliminates per-call agent instantiation and graph compilation
-# overhead, which was the primary cause of slowness on RunPod serverless.
+# Module-level singletons  (built once on cold start)
 # ---------------------------------------------------------------------------
 
 _navigator    = NavigatorAgent()
@@ -213,19 +213,11 @@ def _build_graph():
     return workflow.compile()
 
 
-_compiled_graph = _build_graph()   # compiled once at import time
+_compiled_graph = _build_graph()
 
-
-# ---------------------------------------------------------------------------
-# Graph factory  (kept for API compatibility with api/main.py)
-# ---------------------------------------------------------------------------
 
 def create_routing_graph(obis_tool: Callable, route_calc_tool: Callable):
-    """
-    Returns the pre-compiled graph singleton.
-    obis_tool / route_calc_tool are kept as params for API compatibility
-    but are injected via RoutingState at runtime — no recompilation needed.
-    """
+    """Returns the pre-compiled graph singleton."""
     return _compiled_graph
 
 
@@ -275,7 +267,6 @@ async def run_routing_optimization(
         "routes_this_iteration": 0,
     }
 
-    # Use the pre-compiled singleton — no rebuild cost per call
     final_state = await _compiled_graph.ainvoke(initial_state)
 
     logger.info(

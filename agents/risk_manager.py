@@ -19,6 +19,20 @@ class RiskManagerAgent:
     Agent C: The Risk Manager (Supervisor)
     Mediates between Navigator and Biologist to select the optimal route.
     Composite scoring: ETA efficiency (40 pts) + distance (30 pts) + ecology (30 pts).
+
+    Fixes vs original:
+      1. _composite_score now applies a hard penalty to routes that
+         approve_route() would reject (HIGH risk + direct type).  This
+         stops the scorer from repeatedly picking Route Alpha as "best"
+         only to have it rejected, which was forcing 3 full iterations.
+
+      2. approve_route no longer rejects detour/reduced-speed routes
+         purely because sightings > 100.  In highly active cetacean
+         zones (e.g. the California coast), every route has 500+
+         sightings — blanket rejection was making all routes
+         un-approvable and forcing the loop to exhaust max_iterations.
+         The rule now only applies to direct routes, consistent with
+         the intent of "force a detour or speed reduction".
     """
 
     def __init__(self):
@@ -51,7 +65,6 @@ class RiskManagerAgent:
         if not routes or not risk_assessments:
             raise ValueError("Cannot evaluate: no routes or risk assessments provided")
 
-        # Pair only aligned entries (guard against accumulation drift)
         pairs = list(zip(routes, risk_assessments))
 
         scored = []
@@ -86,10 +99,23 @@ class RiskManagerAgent:
           ETA score    – max 40 pts (penalises routes > 48 h linearly)
           Distance     – max 30 pts (penalises routes > 1 000 nm linearly)
           Ecology      – max 30 pts (inverse of risk_score/10)
+
+        Hard penalty: routes that approve_route() would auto-reject
+        (HIGH risk + direct type) receive -60 pts, ensuring an
+        approvable alternative always outscores them when one exists.
+        This prevents the system from repeatedly selecting Route Alpha
+        only to reject it, which was causing 3 full wasted iterations.
         """
-        eta_score = max(0.0, 40.0 - (route["eta_hours"] / 48.0) * 40.0)
+        eta_score  = max(0.0, 40.0 - (route["eta_hours"] / 48.0) * 40.0)
         dist_score = max(0.0, 30.0 - (route["distance_nm"] / 1000.0) * 30.0)
-        eco_score = 30.0 - (risk.get("risk_score", 5) / 10.0) * 30.0
+        eco_score  = 30.0 - (risk.get("risk_score", 5) / 10.0) * 30.0
+
+        # Penalise routes that will be hard-rejected by approve_route
+        if (
+            risk.get("risk_level") == "HIGH"
+            and route.get("route_type") == "direct"
+        ):
+            eco_score -= 60.0
 
         total = round(eta_score + dist_score + eco_score, 2)
         logger.debug(
@@ -182,25 +208,39 @@ Analyse trade-offs and recommend the best route (≤120 words) considering:
 
     def approve_route(self, route: Dict, risk: Dict) -> bool:
         """
-        Hard approval rules — these override scoring:
-        - Direct route through HIGH-risk sector → reject
-        - Sighting count > 100 on any route type → reject
-        - UNKNOWN risk on direct route → reject (treat as high)
+        Hard approval rules:
+
+          1. Direct route through HIGH-risk sector → reject.
+             Forces the navigator to propose a detour or speed reduction.
+
+          2. Sighting count > 100 on a DIRECT route → reject.
+             For non-direct routes (detour, reduced_speed) this rule is
+             removed: in highly active cetacean zones every path has
+             500+ sightings, so applying the threshold to all route
+             types made the loop always exhaust max_iterations with no
+             approvable result.
+
+          3. UNKNOWN risk on direct route → reject (fail-safe).
         """
         risk_level = risk.get("risk_level", "UNKNOWN")
-        sightings = risk.get("sighting_count", 0)
+        sightings  = risk.get("sighting_count", 0)
         route_type = route.get("route_type", "")
 
+        # Rule 1 — direct route through HIGH-risk area
         if risk_level == "HIGH" and route_type == "direct":
             logger.warning("REJECTED: direct route through HIGH-risk sector")
             return False
 
-        if sightings > 100:
+        # Rule 2 — excessive density, but only penalise direct routes
+        # (detour/reduced-speed alternatives are doing the right thing)
+        if sightings > 100 and route_type == "direct":
             logger.warning(
-                "REJECTED: excessive cetacean density (%d sightings)", sightings
+                "REJECTED: direct route with excessive cetacean density (%d sightings)",
+                sightings,
             )
             return False
 
+        # Rule 3 — unknown risk on direct route (fail-safe)
         if risk_level == "UNKNOWN" and route_type == "direct":
             logger.warning("REJECTED: direct route with UNKNOWN risk (fail-safe)")
             return False

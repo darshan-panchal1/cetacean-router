@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     obis_cache_ttl_seconds: int = 3600        # 1 hour
     obis_request_timeout_seconds: int = 30
     obis_max_retries: int = 3
-    obis_results_size: int = 500
+    obis_results_size: int = 60
 
     # Circuit breaker
     circuit_breaker_failure_threshold: int = 5
